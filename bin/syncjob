@@ -58,7 +58,26 @@ sync_all() {
 sync_all
 (( ONCE )) && exit 0
 
+# hybrid trigger: with inotifywait (optional, e.g. via brew) changes sync
+# instantly and the interval is just a safety ceiling; without it we poll.
+HAVE_INOTIFY=0
+command -v inotifywait >/dev/null 2>&1 && HAVE_INOTIFY=1
+(( HAVE_INOTIFY )) && echo "inotifywait found — syncing instantly on changes"
+
+wait_for_change() {
+    if (( HAVE_INOTIFY )); then
+        local watch=() d
+        for d in "${SRC[@]}" "${DST[@]}"; do [[ -d $d ]] && watch+=("$d"); done
+        [[ ${#watch[@]} -gt 0 ]] || { sleep "$INTERVAL"; return; }
+        # returns on the first event or after $INTERVAL — whichever comes first
+        inotifywait -r -qq -t "$INTERVAL" \
+            -e modify,create,move,close_write,attrib,delete "${watch[@]}" 2>/dev/null || true
+    else
+        sleep "$INTERVAL"
+    fi
+}
+
 while true; do
-    sleep "$INTERVAL"
+    wait_for_change
     sync_all
 done
