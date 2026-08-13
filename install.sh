@@ -16,16 +16,32 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/syncman"
 
 say() { printf ':: %s\n' "$*"; }
 
-do_install() {
-    say "installing syncman, syncjob, syncman-panel to $BIN"
-    install -Dm755 "$SRC/bin/syncman"       "$BIN/syncman"
-    install -Dm755 "$SRC/bin/syncjob"       "$BIN/syncjob"
-    install -Dm755 "$SRC/gui/syncman-panel" "$BIN/syncman-panel"
+# GUI parts are skipped on headless machines; nova exports NOVA_GUI=0/1,
+# standalone installs fall back to checking for the GTK4 stack
+want_gui() {
+    [[ ${NOVA_GUI:-} == 0 ]] && return 1
+    [[ -n ${NOVA_GUI:-} ]] && return 0
+    [[ -e /usr/lib64/girepository-1.0/Gtk-4.0.typelib ||
+       -e /usr/lib/girepository-1.0/Gtk-4.0.typelib ]]
+}
 
-    say "installing desktop entry + service template"
-    mkdir -p "$APPS" "$UNIT_DIR"
-    sed "s|^Exec=.*|Exec=$BIN/syncman-panel|" "$SRC/data/syncman-panel.desktop" \
-        > "$APPS/org.novanetwork.Syncman.desktop"
+do_install() {
+    say "installing syncman + syncjob to $BIN"
+    install -Dm755 "$SRC/bin/syncman" "$BIN/syncman"
+    install -Dm755 "$SRC/bin/syncjob" "$BIN/syncjob"
+
+    if want_gui; then
+        say "installing syncman-panel + desktop entry"
+        install -Dm755 "$SRC/gui/syncman-panel" "$BIN/syncman-panel"
+        mkdir -p "$APPS"
+        sed "s|^Exec=.*|Exec=$BIN/syncman-panel|" "$SRC/data/syncman-panel.desktop" \
+            > "$APPS/org.novanetwork.Syncman.desktop"
+    else
+        say "no GTK4 stack (or NOVA_GUI=0) — skipping panel"
+    fi
+
+    say "installing service template"
+    mkdir -p "$UNIT_DIR"
     # point the template at the actual install prefix
     sed "s|^ExecStart=.*|ExecStart=$BIN/syncjob %i|" "$SRC/data/syncjob@.service" \
         > "$UNIT_DIR/syncjob@.service"
