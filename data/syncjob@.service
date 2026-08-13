@@ -1,0 +1,14 @@
+[Unit]
+Description=syncman job %i — bidirectional folder sync
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/syncjob %i
+Restart=on-failure
+RestartSec=10
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

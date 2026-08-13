@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# syncman — bidirectional pair-wise folder sync manager (user scope only)
+# maintained by the Nova Core Team
+#
+# Jobs are plain files in ~/.config/syncman/jobs/<name>.job, one pair per line:
+#   /path/to/source :: /path/to/destination
+# Each running job is a systemd user service instance: syncjob@<name>.service
+set -euo pipefail
+
+SYNCMAN_VERSION="0.1.0"
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/syncman"
+CONF="$CONF_DIR/syncman.conf"
+
+c_bold=$'\033[1m'; c_grn=$'\033[32m'; c_dim=$'\033[2m'; c_red=$'\033[31m'; c_off=$'\033[0m'
+[[ -t 1 ]] || { c_bold=""; c_grn=""; c_dim=""; c_red=""; c_off=""; }
+
+info() { printf '%s::%s %s\n' "$c_bold" "$c_off" "$*"; }
+die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+
+conf_get() { # key default
+    local v=""
+    [[ -f $CONF ]] && v="$(grep -E "^$1=" "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)"
+    echo "${v:-$2}"
+}
+
+JOBS_DIR="$(conf_get JOBS_DIR "$CONF_DIR/jobs")"
+JOBS_DIR="${JOBS_DIR/#\~/$HOME}"
+
+unit() { echo "syncjob@$1.service"; }
+
+jobs_all() {
+    local f
+    for f in "$JOBS_DIR"/*.job; do
+        [[ -f $f ]] || continue
+        basename "$f" .job
+    done
+}
+
+targets() { # name|all -> job names
+    if [[ $1 == all ]]; then
+        jobs_all
+    else
+        [[ -f "$JOBS_DIR/$1.job" ]] || die "unknown job: $1 (see 'syncman list')"
+        echo "$1"
+    fi
+}
+
+# count real pairs (comments stripped, same rule as the syncjob parser)
+pair_count() { awk -F'#' '$1 ~ / :: / {n++} END{print n+0}' "$JOBS_DIR/$1.job" 2>/dev/null; }
+
+cmd_list() {
+    local j n=0 state enabled col
+    printf '%s%-24s %-6s %-10s %s%s\n' "$c_bold" JOB PAIRS ACTIVE ENABLED "$c_off"
+    for j in $(jobs_all); do
+        n=$((n+1))
+        state="$(systemctl --user is-active "$(unit "$j")" 2>/dev/null || true)"
+        enabled="$(systemctl --user is-enabled "$(unit "$j")" 2>/dev/null || true)"
+        [[ $state == active ]] && col="$c_grn" || col="$c_dim"
+        printf '%-24s %-6s %s%-10s%s %s\n' "$j" "$(pair_count "$j")" \
+            "$col" "${state:-inactive}" "$c_off" "${enabled:-disabled}"
+    done
+    (( n )) || echo "${c_dim}no jobs — create one with: syncman add <name>${c_off}"
+}
+
+cmd_porcelain() { # for the panel: name<TAB>pairs<TAB>active<TAB>enabled
+    local j
+    for j in $(jobs_all); do
+        printf '%s\t%s\t%s\t%s\n' "$j" "$(pair_count "$j")" \
+            "$(systemctl --user is-active  "$(unit "$j")" 2>/dev/null || true)" \
+            "$(systemctl --user is-enabled "$(unit "$j")" 2>/dev/null || true)"
+    done
+}
+
+cmd_add() {
+    local name="${1:-}"
+    [[ -n $name ]] || die "usage: syncman add <name>"
+    [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "job names: letters, digits, . _ - only"
+    mkdir -p "$JOBS_DIR"
+    local f="$JOBS_DIR/$name.job"
+    [[ -f $f ]] && die "job already exists: $f"
+    cat > "$f" <<'EOF'
+# syncman job — one pair per line, separated by " :: "
+# newer files win in both directions; nothing is ever deleted.
+#/path/to/source :: /path/to/destination
+EOF
+    info "created $f — add your pairs, then: syncman start $name"
+    [[ -t 0 && -n ${EDITOR:-} ]] && "$EDITOR" "$f" || true
+}
+
+cmd_edit() {
+    local name="${1:-}"
+    [[ -n $name ]] || die "usage: syncman edit <name>"
+    [[ -f "$JOBS_DIR/$name.job" ]] || die "unknown job: $name"
+    "${EDITOR:-nano}" "$JOBS_DIR/$name.job"
+}
+
+usage() {
+    cat <<EOF
+${c_bold}syncman $SYNCMAN_VERSION${c_off} — bidirectional pair-wise folder sync (user services)
+
+${c_bold}usage:${c_off} syncman <command> [args]
+
+  list                    all jobs with pair count and service state
+  start <name|all>        enable + start a job's background sync service
+  stop  <name|all>        stop + disable it
+  restart <name|all>      restart running services (e.g. after config edits)
+  sync  <name|all>        one-shot sync now (foreground, no service)
+  add   <name>            create a new job file
+  edit  <name>            open a job file in \$EDITOR
+  log   <name>            follow the job's journal
+  version                 print version
+
+${c_bold}files:${c_off}
+  config:  $CONF   (INTERVAL=30, JOBS_DIR=...)
+  jobs:    $JOBS_DIR/<name>.job   ("source :: destination" per line)
+EOF
+}
+
+CMD="${1:-}"; shift || true
+case "$CMD" in
+    list)      cmd_list ;;
+    porcelain) cmd_porcelain ;;
+    start)     for j in $(targets "${1:-all}"); do
+                   systemctl --user enable --now "$(unit "$j")" 2>/dev/null
+                   info "started $j"
+               done ;;
+    stop)      for j in $(targets "${1:-all}"); do
+                   systemctl --user disable --now "$(unit "$j")" 2>/dev/null || true
+                   info "stopped $j"
+               done ;;
+    restart)   for j in $(targets "${1:-all}"); do
+                   systemctl --user try-restart "$(unit "$j")" 2>/dev/null || true
+               done; info "restarted" ;;
+    sync)      for j in $(targets "${1:-all}"); do syncjob "$j" --once; done ;;
+    add)       cmd_add "${1:-}" ;;
+    edit)      cmd_edit "${1:-}" ;;
+    log)       [[ -n ${1:-} ]] || die "usage: syncman log <name>"
+               journalctl --user -u "$(unit "$1")" -e -f ;;
+    version)   echo "syncman $SYNCMAN_VERSION" ;;
+    ""|help|-h|--help) usage ;;
+    *)         die "unknown command: $CMD (see 'syncman help')" ;;
+esac

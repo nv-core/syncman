@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""syncman-panel — GTK4/libadwaita frontend for syncman (GNOME 40+).
+
+Thin UI layer over the syncman CLI: jobs come from `syncman porcelain`,
+switches map to `syncman start/stop <job>`, per-row button = one-shot sync.
+"""
+import os
+import shutil
+import signal
+import subprocess
+import threading
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib, Gio  # noqa: E402
+
+APP_ID = "org.novanetwork.Syncman"
+
+
+def find_cli():
+    for c in (shutil.which("syncman"),
+              os.path.expanduser("~/.local/bin/syncman"),
+              os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "syncman")):
+        if c and os.path.exists(c):
+            return os.path.realpath(c)
+    return None
+
+
+class JobRow(Adw.ActionRow):
+    def __init__(self, win, name, pairs, active):
+        super().__init__()
+        self.win = win
+        self.name = name
+        self.set_use_markup(False)
+        self.set_title(name)
+        self.set_subtitle(f"{pairs} pair(s)")
+
+        self.btn_sync = Gtk.Button(icon_name="emblem-synchronizing-symbolic",
+                                   valign=Gtk.Align.CENTER,
+                                   tooltip_text="Sync now (one-shot)")
+        self.btn_sync.add_css_class("flat")
+        self.btn_sync.connect("clicked", self.on_sync_now)
+        self.add_suffix(self.btn_sync)
+
+        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER,
+                                 tooltip_text="Background sync service")
+        self._guard = True
+        self.switch.set_active(active)
+        self._guard = False
+        self.switch.connect("notify::active", self.on_toggled)
+        self.add_suffix(self.switch)
+        self.set_activatable_widget(self.switch)
+
+    def on_toggled(self, *_):
+        if self._guard:
+            return
+        verb = "start" if self.switch.get_active() else "stop"
+        self.win.run_cli([verb, self.name], f"{verb} {self.name}")
+
+    def on_sync_now(self, *_):
+        self.win.run_cli(["sync", self.name], f"sync {self.name}")
+
+
+class SyncmanWindow(Adw.ApplicationWindow):
+    def __init__(self, app, cli):
+        super().__init__(application=app, title="Syncman")
+        self.cli = cli
+        self.busy = False
+        self.rows = []
+        self.set_default_size(560, 520)
+
+        header = Adw.HeaderBar()
+        self.title = Adw.WindowTitle(title="Syncman")
+        header.set_title_widget(self.title)
+
+        self.btn_refresh = Gtk.Button(icon_name="view-refresh-symbolic",
+                                      tooltip_text="Refresh")
+        self.btn_refresh.connect("clicked", lambda *_: self.refresh())
+        header.pack_start(self.btn_refresh)
+
+        btn_folder = Gtk.Button(icon_name="folder-open-symbolic",
+                                tooltip_text="Open jobs folder")
+        btn_folder.connect("clicked", self.on_open_folder)
+        header.pack_end(btn_folder)
+
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.listbox.add_css_class("boxed-list")
+        clamp = Adw.Clamp(maximum_size=640, child=self.listbox,
+                          margin_top=18, margin_bottom=18,
+                          margin_start=12, margin_end=12)
+        scroll = Gtk.ScrolledWindow(child=clamp, vexpand=True,
+                                    hscrollbar_policy=Gtk.PolicyType.NEVER)
+
+        self.empty = Adw.StatusPage(
+            icon_name="emblem-synchronizing-symbolic",
+            title="No Sync Jobs",
+            description="Create one with:  <tt>syncman add NAME</tt>\n"
+                        "then define pairs:  <tt>source :: destination</tt>",
+            vexpand=True,
+        )
+        self.stack = Gtk.Stack()
+        self.stack.add_named(scroll, "list")
+        self.stack.add_named(self.empty, "empty")
+
+        self.toasts = Adw.ToastOverlay(child=self.stack)
+        view = Adw.ToolbarView(content=self.toasts)
+        view.add_top_bar(header)
+        self.set_content(view)
+
+        self.refresh()
+
+    def jobs_dir(self):
+        conf_dir = os.path.join(GLib.get_user_config_dir(), "syncman")
+        conf = os.path.join(conf_dir, "syncman.conf")
+        jobs = os.path.join(conf_dir, "jobs")
+        try:
+            with open(conf) as fh:
+                for line in fh:
+                    if line.startswith("JOBS_DIR="):
+                        jobs = os.path.expanduser(line.split("=", 1)[1].strip())
+        except OSError:
+            pass
+        return jobs
+
+    def on_open_folder(self, *_):
+        d = self.jobs_dir()
+        os.makedirs(d, exist_ok=True)
+        Gio.AppInfo.launch_default_for_uri(f"file://{d}", None)
+
+    def refresh(self):
+        def worker():
+            try:
+                out = subprocess.run([self.cli, "porcelain"], capture_output=True,
+                                     text=True, timeout=30).stdout
+            except Exception as e:  # noqa: BLE001
+                out = ""
+                GLib.idle_add(self.toast, f"refresh failed: {e}")
+            GLib.idle_add(self.populate, out)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def populate(self, porcelain):
+        self.listbox.remove_all()
+        self.rows = []
+        active_n = 0
+        for line in porcelain.splitlines():
+            p = line.split("\t")
+            if len(p) < 4:
+                continue
+            name, pairs, active, _enabled = p[:4]
+            if active == "active":
+                active_n += 1
+            row = JobRow(self, name, pairs, active == "active")
+            self.listbox.append(row)
+            self.rows.append(row)
+        self.stack.set_visible_child_name("list" if self.rows else "empty")
+        self.title.set_subtitle(f"{len(self.rows)} jobs · {active_n} running" if self.rows else "")
+        return False
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast.new(text))
+        return False
+
+    def run_cli(self, args, label):
+        def worker():
+            try:
+                r = subprocess.run([self.cli] + args, capture_output=True,
+                                   text=True, timeout=300)
+                ok = r.returncode == 0
+                msg = label if ok else (r.stderr.strip().splitlines() or [f"{label} failed"])[-1]
+            except Exception as e:  # noqa: BLE001
+                ok, msg = False, str(e)
+            GLib.idle_add(self.toast, ("✓ " if ok else "✗ ") + msg)
+            GLib.idle_add(self.refresh)
+        threading.Thread(target=worker, daemon=True).start()
+
+
+class SyncmanApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if not win:
+            cli = find_cli()
+            if not cli:
+                raise SystemExit("syncman CLI not found — install syncman first")
+            win = SyncmanWindow(self, cli)
+        win.present()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    raise SystemExit(SyncmanApp().run(None))

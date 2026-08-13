@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Syncman
+Comment=Bidirectional folder sync for game saves and more
+Exec=syncman-panel
+Icon=emblem-synchronizing
+Terminal=false
+Categories=Utility;System;
+Keywords=sync;rsync;saves;backup;
